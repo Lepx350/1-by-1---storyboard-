@@ -500,6 +500,25 @@ def get_char_view_prompt(cid, view):
         return get_char_base() + chars[cid]["views"][view]
     return get_char_base()
 
+def get_char_sheet_prompt(cid):
+    """Build single character reference sheet prompt — front view, back view, close-up on one image."""
+    chars = get_active_characters()
+    if cid not in chars:
+        return get_char_base()
+    c = chars[cid]
+    desc = c.get("desc", "")
+    name = c.get("name", cid)
+    return (
+        get_char_base() +
+        f"CHARACTER REFERENCE SHEET for {name}. "
+        f"Three views on one image, side by side, labeled: "
+        f"FRONT VIEW (full body, facing camera) | BACK VIEW (full body, facing away) | CLOSE-UP (head and shoulders portrait). "
+        f"Character description: {desc}. "
+        f"All three views must show the EXACT same character with identical clothing, proportions, and colors. "
+        f"Clean simple background. Labels under each view. Professional character design sheet layout. "
+        f"16:9 widescreen format. "
+    )
+
 ENVIRONMENTS = {
     "vault_interior": {"name": "Vault Interior", "keywords": ["vault interior", "vault floor", "safe deposit box", "boxes", "vault room", "inside vault", "vault wall"],
         "prompt_detail": "ENVIRONMENT REFERENCE — EMPTY. Interior of massive underground bank vault. Rows of metal safe deposit boxes. Single dramatic overhead spotlight. Polished concrete floor. Industrial. Wide 16:9. No people."},

@@ -13,7 +13,7 @@ from engine import (
     parse_storyboard, get_asset_type, get_image_prompt, get_section,
     detect_characters, detect_environment, count_words,
     get_world_anchor, get_primary_style, get_secondary_style,
-    get_char_base, get_grade_params, get_char_view_prompt, get_env_prompt,
+    get_char_base, get_grade_params, get_char_view_prompt, get_char_sheet_prompt, get_env_prompt,
     get_master_shot_prompt, build_prompt,
     get_config, gen_single, gen_chat_section, extract_image,
     post_process, VisualMemoryBank,
@@ -80,7 +80,7 @@ def upload():
 
     # Setup output dirs
     out = upload_dir / "generated_images"
-    for d in ["characters/front", "characters/three_quarter", "characters/action",
+    for d in ["characters",
               "environments", "master_shots", "scenes", "post_processed", "final"]:
         (out / d).mkdir(parents=True, exist_ok=True)
 
@@ -308,10 +308,8 @@ def generate_one():
 
     refs = []
     if primary_char and asset != 'fern':
-        front = out / "characters" / "front" / f"@{primary_char}.png"
-        tq = out / "characters" / "three_quarter" / f"@{primary_char}.png"
-        if front.exists(): refs.append(str(front))
-        if tq.exists(): refs.append(str(tq))
+        sheet = out / "characters" / f"@{primary_char}.png"
+        if sheet.exists(): refs.append(str(sheet))
     if env_id and asset != 'fern':
         master = out / "master_shots" / f"{env_id}_master.png"
         basic = out / "environments" / f"{env_id}.png"
@@ -396,16 +394,12 @@ def pipeline_status():
     # Characters
     chars_done = []
     for cid in state.get("used_chars", []):
-        front = out / "characters" / "front" / f"@{cid}.png"
-        tq = out / "characters" / "three_quarter" / f"@{cid}.png"
-        action = out / "characters" / "action" / f"@{cid}.png"
+        sheet = out / "characters" / f"@{cid}.png"
         active_chars = get_active_characters()
         name = active_chars.get(cid, {}).get("name", cid)
         chars_done.append({
             "id": cid, "name": name,
-            "front": front.exists(),
-            "three_quarter": tq.exists(),
-            "action": action.exists(),
+            "done": sheet.exists(),
         })
 
     # Environments + Masters
@@ -434,22 +428,18 @@ def pipeline_status():
         scenes_done=scenes_done, scenes_total=len(gen), graded=graded,
     )
 
-@app.route("/api/ref/<ref_type>/<name>")
-def serve_ref(ref_type, n):
+@app.route("/api/ref/<ref_type>/<ref_name>")
+def serve_ref(ref_type, ref_name):
     """Serve character/env/master reference images."""
     if not state["output_dir"]:
         return "No project", 404
     out = state["output_dir"]
-    if ref_type == "char_front":
-        p = out / "characters" / "front" / f"@{n}.png"
-    elif ref_type == "char_tq":
-        p = out / "characters" / "three_quarter" / f"@{n}.png"
-    elif ref_type == "char_action":
-        p = out / "characters" / "action" / f"@{n}.png"
+    if ref_type == "char" or ref_type == "char_front" or ref_type == "char_tq" or ref_type == "char_action":
+        p = out / "characters" / f"@{ref_name}.png"
     elif ref_type == "env":
-        p = out / "environments" / f"{n}.png"
+        p = out / "environments" / f"{ref_name}.png"
     elif ref_type == "master":
-        p = out / "master_shots" / f"{n}_master.png"
+        p = out / "master_shots" / f"{ref_name}_master.png"
     else:
         return "Unknown type", 404
     if p.exists():
@@ -474,29 +464,26 @@ def run_characters(key):
             log("ERROR: No storyboard uploaded", "fail"); return
         client = get_client(key)
         out = state["output_dir"]
-        views = ["front", "three_quarter", "action"]
         chars = sorted(state["used_chars"])
-        total = len(chars) * len(views)
+        total = len(chars)
         done = 0
-        log(f"STEP 1: CHARACTERS ({len(chars)} x 3 = {total})", "head")
+        log(f"STEP 1: CHARACTER SHEETS ({total} characters)", "head")
 
         for cid in chars:
             if state["stop"]: break
-            for view in views:
-                if state["stop"]: break
-                done += 1; prog(done, total)
-                p = out / "characters" / view / f"@{cid}.png"
-                if p.exists():
-                    log(f"[SKIP] @{cid} ({view})")
-                    continue
-                log(f"[GEN] @{cid} ({view})...")
-                try:
-                    img = gen_single(client, get_char_view_prompt(cid, view))
-                    if img: p.write_bytes(img); log(f"OK → @{cid}_{view}", "ok")
-                    else: log(f"WARN @{cid}", "warn")
-                except Exception as e:
-                    log(f"FAIL: {str(e)[:80]}", "fail")
-                time.sleep(4)
+            done += 1; prog(done, total)
+            p = out / "characters" / f"@{cid}.png"
+            if p.exists():
+                log(f"[SKIP] @{cid}")
+                continue
+            log(f"[GEN] @{cid} sheet...")
+            try:
+                img = gen_single(client, get_char_sheet_prompt(cid))
+                if img: p.write_bytes(img); log(f"OK → @{cid}", "ok")
+                else: log(f"WARN @{cid}", "warn")
+            except Exception as e:
+                log(f"FAIL: {str(e)[:80]}", "fail")
+            time.sleep(4)
         log("Step 1 done!", "ok")
     except Exception as e:
         log(f"PIPELINE ERROR: {str(e)[:120]}", "fail")
@@ -565,29 +552,26 @@ def run_full_pipeline(key):
         client = get_client(key)
         out = state["output_dir"]
 
-        # Step 1: Characters
-        views = ["front", "three_quarter", "action"]
+        # Step 1: Characters (single sheet per character)
         chars = sorted(state["used_chars"])
-        chars_total = len(chars) * len(views)
-        chars_remaining = sum(1 for cid in chars for v in views if not (out / "characters" / v / f"@{cid}.png").exists())
+        chars_total = len(chars)
+        chars_remaining = sum(1 for cid in chars if not (out / "characters" / f"@{cid}.png").exists())
         if chars_remaining > 0:
-            log(f"STEP 1: CHARACTERS ({chars_remaining} remaining of {chars_total})", "head")
+            log(f"STEP 1: CHARACTER SHEETS ({chars_remaining} remaining of {chars_total})", "head")
             done = 0
             for cid in chars:
                 if state["stop"]: return
-                for view in views:
-                    if state["stop"]: return
-                    done += 1; prog(done, chars_total)
-                    p = out / "characters" / view / f"@{cid}.png"
-                    if p.exists(): log(f"[SKIP] @{cid} ({view})"); continue
-                    log(f"[GEN] @{cid} ({view})...")
-                    try:
-                        img = gen_single(client, get_char_view_prompt(cid, view))
-                        if img: p.write_bytes(img); log(f"OK → @{cid}_{view}", "ok")
-                        else: log(f"WARN @{cid}", "warn")
-                    except Exception as e:
-                        log(f"FAIL: {str(e)[:80]}", "fail")
-                    time.sleep(4)
+                done += 1; prog(done, chars_total)
+                p = out / "characters" / f"@{cid}.png"
+                if p.exists(): log(f"[SKIP] @{cid}"); continue
+                log(f"[GEN] @{cid} sheet...")
+                try:
+                    img = gen_single(client, get_char_sheet_prompt(cid))
+                    if img: p.write_bytes(img); log(f"OK → @{cid}", "ok")
+                    else: log(f"WARN @{cid}", "warn")
+                except Exception as e:
+                    log(f"FAIL: {str(e)[:80]}", "fail")
+                time.sleep(4)
             log("Characters done!", "ok")
         else:
             log("STEP 1: CHARACTERS — all done, skipping", "ok")
@@ -644,11 +628,9 @@ def run_full_pipeline(key):
             # Gather refs
             char_refs = {}
             for cid in get_active_characters():
-                front = out / "characters" / "front" / f"@{cid}.png"
-                tq = out / "characters" / "three_quarter" / f"@{cid}.png"
-                if front.exists():
-                    char_refs[cid] = [str(front)]
-                    if tq.exists(): char_refs[cid].append(str(tq))
+                sheet = out / "characters" / f"@{cid}.png"
+                if sheet.exists():
+                    char_refs[cid] = [str(sheet)]
             env_refs = {}
             for eid in ENVIRONMENTS:
                 master = out / "master_shots" / f"{eid}_master.png"
@@ -666,7 +648,7 @@ def run_full_pipeline(key):
                 primary_char = chars[0] if chars else None
                 refs = []
                 if primary_char and primary_char in char_refs and asset != 'fern':
-                    refs = mb.get_char_refs(primary_char, char_refs[primary_char][:2])
+                    refs = list(char_refs[primary_char])
                 if env_id and env_id in env_refs and asset != 'fern' and len(refs) < 6:
                     refs.extend(mb.get_env_ref(env_id, env_refs.get(env_id)))
                 prompt = build_prompt(p, primary_char, env_id)
@@ -742,11 +724,9 @@ def run_scenes(key, section_filter):
         # Gather refs
         char_refs = {}
         for cid in get_active_characters():
-            front = out / "characters" / "front" / f"@{cid}.png"
-            tq = out / "characters" / "three_quarter" / f"@{cid}.png"
-            if front.exists():
-                char_refs[cid] = [str(front)]
-                if tq.exists(): char_refs[cid].append(str(tq))
+            sheet = out / "characters" / f"@{cid}.png"
+            if sheet.exists():
+                char_refs[cid] = [str(sheet)]
 
         env_refs = {}
         for eid in ENVIRONMENTS:
@@ -769,7 +749,7 @@ def run_scenes(key, section_filter):
             primary_char = chars[0] if chars else None
             refs = []
             if primary_char and primary_char in char_refs and asset != 'fern':
-                refs = mb.get_char_refs(primary_char, char_refs[primary_char][:2])
+                refs = list(char_refs[primary_char])
             if env_id and env_id in env_refs and asset != 'fern' and len(refs) < 6:
                 refs.extend(mb.get_env_ref(env_id, env_refs.get(env_id)))
             prompt = build_prompt(p, primary_char, env_id)

@@ -218,7 +218,7 @@ body{font-family:'Outfit',system-ui,sans-serif;background:var(--bg);color:var(--
     <div class="col-h open" onclick="toggleCol('charBody',this)" style="margin-top:12px">
       <div class="lbl" style="margin:0;flex:1">Characters <span id="charCount" style="color:var(--m)"></span></div><span class="ch">▼</span>
     </div>
-    <div class="col-b open" id="charBody"><div id="charGal" class="gal"></div></div>
+    <div class="col-b open" id="charBody"><div id="charGal" class="gal-env"></div></div>
 
     <div class="col-h open" onclick="toggleCol('envBody',this)" style="margin-top:8px">
       <div class="lbl" style="margin:0;flex:1">Environments <span id="envCount" style="color:var(--a)"></span></div><span class="ch">▼</span>
@@ -403,7 +403,7 @@ async function loadRefs(){
     const d=await res.json();
     renderCharGallery(d.chars||[]);
     renderEnvGallery(d.envs||[]);
-    const charsDone=(d.chars||[]).filter(c=>c.front).length;
+    const charsDone=(d.chars||[]).filter(c=>c.done).length;
     const envsDone=(d.envs||[]).filter(e=>e.env).length;
     $('refsCnt').textContent=`${charsDone+envsDone}`;
   }catch(e){}
@@ -411,12 +411,11 @@ async function loadRefs(){
 
 function renderCharGallery(chars){
   if(!chars.length)return;
-  $('charCount').textContent=`${chars.filter(c=>c.front).length}/${chars.length}`;
-  $('charGal').innerHTML=chars.map(c=>['front','three_quarter','action'].map(v=>{
-    const k=v==='three_quarter'?'tq':v;
-    const l=v==='three_quarter'?'¾':v==='front'?'F':'A';
-    return c[v]?`<div class="gal-item" onclick="openPv('/api/ref/char_${k}/${c.id}','@${c.id} ${l}')"><img src="/api/ref/char_${k}/${c.id}" loading="lazy"><div class="gl">@${c.id} ${l}</div></div>`:`<div class="gal-item empty">@${c.id} ${l}</div>`;
-  }).join('')).join('');
+  $('charCount').textContent=`${chars.filter(c=>c.done).length}/${chars.length}`;
+  $('charGal').innerHTML=chars.map(c=>{
+    if(c.done) return `<div class="gal-item" style="aspect-ratio:16/9" onclick="openPv('/api/ref/char/${c.id}','@${c.id} — ${c.name}')"><img src="/api/ref/char/${c.id}" loading="lazy"><div class="gl">@${c.id}</div></div>`;
+    return `<div class="gal-item empty" style="aspect-ratio:16/9">@${c.id}</div>`;
+  }).join('');
 }
 
 function renderEnvGallery(envs){

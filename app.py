@@ -14,7 +14,7 @@ from engine import (
     detect_characters, detect_environment, count_words,
     get_world_anchor, get_primary_style, get_secondary_style,
     get_char_base, get_grade_params, get_char_view_prompt, get_char_sheet_prompt, get_env_prompt,
-    get_master_shot_prompt, build_prompt,
+    get_master_shot_prompt, get_style_anchor_prompt, score_consistency, build_adaptive_prompt, build_prompt,
     get_config, gen_single, gen_chat_section, extract_image,
     post_process, VisualMemoryBank,
     load_config, save_config,
@@ -81,7 +81,7 @@ def upload():
     # Setup output dirs
     out = upload_dir / "generated_images"
     for d in ["characters",
-              "environments", "master_shots", "scenes", "post_processed", "final"]:
+              "environments", "master_shots", "scenes", "post_processed", "final", "style_anchor"]:
         (out / d).mkdir(parents=True, exist_ok=True)
 
     state["panels"] = panels
@@ -267,7 +267,7 @@ def list_panels():
 
 @app.route("/api/generate_one", methods=["POST"])
 def generate_one():
-    """Generate a single panel image. Synchronous — returns when done."""
+    """Generate a single panel image with 12-layer consistency. Synchronous."""
     if state.get("running"):
         return jsonify(error="Pipeline running. Stop it first or wait."), 409
     data = request.json or {}
@@ -299,32 +299,77 @@ def generate_one():
         f = out / folder / fname
         if f.exists(): f.unlink()
 
-    # Gather refs
+    # ── LAYER 8: Gather ALL character refs ──
     pid = panel_id
-    chars = state["char_map"].get(pid, [])
+    all_chars = state["char_map"].get(pid, [])
     env_id = state["env_map"].get(pid)
     asset = get_asset_type(panel)
-    primary_char = chars[0] if chars else None
+    primary_char = all_chars[0] if all_chars else None
 
     refs = []
-    if primary_char and asset != 'fern':
-        sheet = out / "characters" / f"@{primary_char}.png"
-        if sheet.exists(): refs.append(str(sheet))
-    if env_id and asset != 'fern':
+    if asset != 'fern':
+        for cid in all_chars:
+            sheet = out / "characters" / f"@{cid}.png"
+            if sheet.exists() and str(sheet) not in refs:
+                refs.append(str(sheet))
+        if len(refs) > 3: refs = refs[:3]  # cap char refs at 3
+
+    # ── LAYER 9: Style anchor ref ──
+    style_anchor = out / "style_anchor" / "style_key.png"
+    if style_anchor.exists() and len(refs) < 5:
+        refs.append(str(style_anchor))
+
+    # Environment ref
+    if env_id and asset != 'fern' and len(refs) < 6:
         master = out / "master_shots" / f"{env_id}_master.png"
         basic = out / "environments" / f"{env_id}.png"
         if master.exists(): refs.append(str(master))
         elif basic.exists(): refs.append(str(basic))
 
-    prompt = build_prompt(panel, primary_char, env_id)
+    # ── LAYER 10: Section bridge ref ──
+    mb = state.get("memory_bank")
+    if mb and len(refs) < 6:
+        section_order = list(dict.fromkeys(get_section(p) for p in gen))
+        bridge = mb.get_previous_section_bridge(get_section(panel), section_order)
+        if bridge and bridge not in refs:
+            refs.append(bridge)
+
+    # Build prompt with ALL characters (Layer 8)
+    prompt = build_prompt(panel, primary_char, env_id, all_chars=all_chars)
 
     try:
         client = get_client(key)
         img = gen_single(client, prompt, refs)
-        if img:
-            out_path.write_bytes(img)
-            return jsonify(ok=True, panel_id=panel_id, size=len(img))
-        return jsonify(error="No image returned from API"), 500
+        if not img:
+            return jsonify(error="No image returned from API"), 500
+        out_path.write_bytes(img)
+
+        # ── LAYER 11: Consistency scoring ──
+        score = 100
+        issues = ""
+        char_refs_for_score = [str(out / "characters" / f"@{c}.png") for c in all_chars
+                               if (out / "characters" / f"@{c}.png").exists()]
+        if char_refs_for_score and asset != 'fern':
+            score, issues = score_consistency(client, str(out_path), char_refs_for_score, pid)
+
+        # ── LAYER 12: Adaptive retry if low score ──
+        if score < 60 and char_refs_for_score:
+            adaptive_prompt = build_adaptive_prompt(prompt, score, issues, attempt=1)
+            retry_img = gen_single(client, adaptive_prompt, refs)
+            if retry_img:
+                out_path.write_bytes(retry_img)
+                score2, issues2 = score_consistency(client, str(out_path), char_refs_for_score, pid)
+                if score2 > score:
+                    score, issues = score2, issues2
+
+        # Update memory bank
+        if mb:
+            if primary_char: mb.update_char(primary_char, str(out_path))
+            if env_id: mb.update_env(env_id, str(out_path))
+            mb.update_section(get_section(panel), str(out_path))
+
+        return jsonify(ok=True, panel_id=panel_id, size=len(img),
+                      consistency_score=score, issues=issues)
     except Exception as e:
         return jsonify(error=str(e)[:200]), 500
 
@@ -423,19 +468,46 @@ def pipeline_status():
     # Graded
     graded = len(list((out / "post_processed").glob("*.png"))) if (out / "post_processed").exists() else 0
 
+    # Style anchor (Layer 9)
+    style_anchor = (out / "style_anchor" / "style_key.png").exists()
+
     return jsonify(
         chars=chars_done, envs=envs_done,
         scenes_done=scenes_done, scenes_total=len(gen), graded=graded,
+        style_anchor=style_anchor,
     )
+
+@app.route("/api/gen_style_anchor", methods=["POST"])
+def gen_style_anchor_endpoint():
+    """Generate the style anchor image (Layer 9)."""
+    if not state["output_dir"]:
+        return jsonify(error="No storyboard loaded"), 400
+    data = request.json or {}
+    key = data.get("api_key") or load_config().get("api_key") or os.environ.get("GEMINI_API_KEY")
+    if not key:
+        return jsonify(error="No API key"), 400
+    out = state["output_dir"]
+    style_path = out / "style_anchor" / "style_key.png"
+    try:
+        client = get_client(key)
+        img = gen_single(client, get_style_anchor_prompt())
+        if img:
+            style_path.write_bytes(img)
+            return jsonify(ok=True, size=len(img))
+        return jsonify(error="No image returned"), 500
+    except Exception as e:
+        return jsonify(error=str(e)[:200]), 500
 
 @app.route("/api/ref/<ref_type>/<ref_name>")
 def serve_ref(ref_type, ref_name):
-    """Serve character/env/master reference images."""
+    """Serve character/env/master/style reference images."""
     if not state["output_dir"]:
         return "No project", 404
     out = state["output_dir"]
     if ref_type == "char" or ref_type == "char_front" or ref_type == "char_tq" or ref_type == "char_action":
         p = out / "characters" / f"@{ref_name}.png"
+    elif ref_type == "style_anchor":
+        p = out / "style_anchor" / f"{ref_name}.png"
     elif ref_type == "env":
         p = out / "environments" / f"{ref_name}.png"
     elif ref_type == "master":
@@ -543,7 +615,8 @@ def run_environments(key):
         state["running"] = False
 
 def run_full_pipeline(key):
-    """Auto-chain: Characters → Envs+Masters → Scenes → Grade → Export."""
+    """Auto-chain: Style Anchor → Characters → Envs+Masters → Scenes → Grade → Export.
+    Full L1-L12 consistency engine."""
     try:
         if not state["output_dir"]:
             log("ERROR: No storyboard uploaded. Upload a .jsx file first.", "fail"); return
@@ -551,6 +624,20 @@ def run_full_pipeline(key):
             log("ERROR: No panels parsed. Re-upload the storyboard.", "fail"); return
         client = get_client(key)
         out = state["output_dir"]
+
+        # Step 0: Style Anchor (Layer 9)
+        style_path = out / "style_anchor" / "style_key.png"
+        if not style_path.exists():
+            log("STEP 0: STYLE ANCHOR (L9)", "head")
+            try:
+                img = gen_single(client, get_style_anchor_prompt())
+                if img: style_path.write_bytes(img); log("OK → style_key", "ok")
+                else: log("WARN: No style anchor generated", "warn")
+            except Exception as e:
+                log(f"WARN: Style anchor failed: {str(e)[:60]}", "warn")
+            time.sleep(4)
+        else:
+            log("STEP 0: STYLE ANCHOR — done, skipping", "ok")
 
         # Step 1: Characters (single sheet per character)
         chars = sorted(state["used_chars"])
@@ -624,7 +711,7 @@ def run_full_pipeline(key):
             for d in ["final", "post_processed", "scenes"]
         )]
         if remaining:
-            log(f"Generating {len(remaining)} scenes ({len(all_gen) - len(remaining)} already done)", "head")
+            log(f"Generating {len(remaining)} scenes ({len(all_gen) - len(remaining)} already done) — L1-L12", "head")
             # Gather refs
             char_refs = {}
             for cid in get_active_characters():
@@ -638,44 +725,92 @@ def run_full_pipeline(key):
                 if master.exists(): env_refs[eid] = str(master)
                 elif basic.exists(): env_refs[eid] = str(basic)
 
+            # Style anchor path (Layer 9)
+            style_anchor = out / "style_anchor" / "style_key.png"
+            style_ref = str(style_anchor) if style_anchor.exists() else None
+
+            # Section order for cross-section bridge (Layer 10)
+            section_order = list(dict.fromkeys(get_section(p) for p in all_gen))
+
             sections = {}
             for p in all_gen:
                 sec = get_section(p)
                 if sec not in sections: sections[sec] = []
-                pid = p['id']; chars = state["char_map"].get(pid, [])
+                pid = p['id']
+                all_chars = state["char_map"].get(pid, [])
                 env_id = state["env_map"].get(pid); asset = get_asset_type(p)
                 fname = f"{p.get('f', pid)}.png"
-                primary_char = chars[0] if chars else None
+                primary_char = all_chars[0] if all_chars else None
+
+                # ── Layer 8: ALL character sheet refs ──
                 refs = []
-                if primary_char and primary_char in char_refs and asset != 'fern':
-                    refs = list(char_refs[primary_char])
+                if asset != 'fern':
+                    for cid in all_chars:
+                        if cid in char_refs:
+                            refs.extend(char_refs[cid])
+                    if len(refs) > 3: refs = refs[:3]
+
+                # ── Layer 9: Style anchor ──
+                if style_ref and len(refs) < 5:
+                    refs.append(style_ref)
+
+                # Environment + master refs
                 if env_id and env_id in env_refs and asset != 'fern' and len(refs) < 6:
                     refs.extend(mb.get_env_ref(env_id, env_refs.get(env_id)))
-                prompt = build_prompt(p, primary_char, env_id)
+
+                # ── Layer 10: Section bridge ──
+                if len(refs) < 6:
+                    bridge = mb.get_previous_section_bridge(sec, section_order)
+                    if bridge and bridge not in refs:
+                        refs.append(bridge)
+
+                # ── Layer 8: Pass all chars to prompt builder ──
+                prompt = build_prompt(p, primary_char, env_id, all_chars=all_chars)
                 sections[sec].append({
                     "id": pid, "prompt": prompt, "refs": refs,
                     "output": str(out / "scenes" / fname),
-                    "info": f"@{primary_char or '-'} {asset}", "char": primary_char, "env": env_id, "stop": False,
+                    "info": f"@{','.join(all_chars) if all_chars else '-'} {asset}",
+                    "char": primary_char, "all_chars": all_chars, "env": env_id, "stop": False,
                 })
 
             total_scenes = len(all_gen)
             done_n = total_scenes - len(remaining); ok_n = 0; fail_n = 0
+            last_output = {}  # track last output per section for L10
+
             def cb(event, *args):
                 nonlocal done_n, ok_n, fail_n
                 if event == "generating":
                     done_n += 1; prog(done_n, total_scenes)
                     log(f"[{done_n}/{total_scenes}] {args[0]} {args[1] if len(args)>1 else ''}")
                 elif event == "ok":
-                    ok_n += 1; log(f"OK → {args[0]}", "ok")
+                    ok_n += 1; pid = args[0]
+                    log(f"OK → {pid}", "ok")
+                    # Update memory bank for ALL characters in this panel (L8)
+                    pd = {pd["id"]: pd for sec in sections.values() for pd in sec}.get(pid)
+                    if pd:
+                        for cid in pd.get("all_chars", []):
+                            mb.update_char(cid, pd["output"])
+                        if pd.get("env"):
+                            mb.update_env(pd["env"], pd["output"])
+                        last_output[get_section_from_pid(pid)] = pd["output"]
                 elif event == "skip":
                     done_n += 1; prog(done_n, total_scenes)
                 elif event == "fail":
                     fail_n += 1; log(f"FAIL {args[0]}: {args[1] if len(args)>1 else ''}", "fail")
 
+            # Helper to get section from panel ID
+            def get_section_from_pid(pid):
+                for p in all_gen:
+                    if p.get("id") == pid: return get_section(p)
+                return ""
+
             for sec_name, sec_panels in sections.items():
                 if state["stop"]: return
-                log(f"\n--- {sec_name} ({len(sec_panels)} panels) ---", "head")
+                log(f"\n--- {sec_name} ({len(sec_panels)} panels, L1-L12) ---", "head")
                 gen_chat_section(client, sec_name, sec_panels, callback=cb)
+                # Layer 10: Save last frame as section bridge
+                if sec_name in last_output:
+                    mb.update_section(sec_name, last_output[sec_name])
             log(f"Scenes done! OK:{ok_n} Fail:{fail_n}", "ok")
         else:
             log("STEP 3: SCENES — all done, skipping", "ok")
@@ -735,31 +870,59 @@ def run_scenes(key, section_filter):
             if master.exists(): env_refs[eid] = str(master)
             elif basic.exists(): env_refs[eid] = str(basic)
 
+        # Style anchor (Layer 9)
+        style_anchor = out / "style_anchor" / "style_key.png"
+        style_ref = str(style_anchor) if style_anchor.exists() else None
+
+        # Section order for cross-section bridge (Layer 10)
+        section_order = list(dict.fromkeys(get_section(p) for p in all_gen))
+
         total = len(target)
-        log(f"STEP 3: {label} ({total} panels, L1-L7)", "head")
+        log(f"STEP 3: {label} ({total} panels, L1-L12)", "head")
 
         # Group by section
         sections = {}
         for p in target:
             sec = get_section(p)
             if sec not in sections: sections[sec] = []
-            pid = p['id']; chars = state["char_map"].get(pid, [])
+            pid = p['id']
+            all_chars = state["char_map"].get(pid, [])
             env_id = state["env_map"].get(pid); asset = get_asset_type(p)
             fname = f"{p.get('f', pid)}.png"
-            primary_char = chars[0] if chars else None
+            primary_char = all_chars[0] if all_chars else None
+
+            # Layer 8: ALL character refs
             refs = []
-            if primary_char and primary_char in char_refs and asset != 'fern':
-                refs = list(char_refs[primary_char])
+            if asset != 'fern':
+                for cid in all_chars:
+                    if cid in char_refs:
+                        refs.extend(char_refs[cid])
+                if len(refs) > 3: refs = refs[:3]
+
+            # Layer 9: Style anchor
+            if style_ref and len(refs) < 5:
+                refs.append(style_ref)
+
+            # Environment refs
             if env_id and env_id in env_refs and asset != 'fern' and len(refs) < 6:
                 refs.extend(mb.get_env_ref(env_id, env_refs.get(env_id)))
-            prompt = build_prompt(p, primary_char, env_id)
+
+            # Layer 10: Section bridge
+            if len(refs) < 6:
+                bridge = mb.get_previous_section_bridge(sec, section_order)
+                if bridge and bridge not in refs:
+                    refs.append(bridge)
+
+            prompt = build_prompt(p, primary_char, env_id, all_chars=all_chars)
             sections[sec].append({
                 "id": pid, "prompt": prompt, "refs": refs,
                 "output": str(out / "scenes" / fname),
-                "info": f"@{primary_char or '-'} {asset}", "char": primary_char, "env": env_id, "stop": False,
+                "info": f"@{','.join(all_chars) if all_chars else '-'} {asset}",
+                "char": primary_char, "all_chars": all_chars, "env": env_id, "stop": False,
             })
 
         done = 0; ok_n = 0; fail_n = 0
+        last_output = {}
 
         def cb(event, *args):
             nonlocal done, ok_n, fail_n
@@ -769,10 +932,14 @@ def run_scenes(key, section_filter):
             elif event == "ok":
                 ok_n += 1; pid = args[0]
                 log(f"OK → {pid}", "ok")
-                if pid in {pd["id"]: pd for sec in sections.values() for pd in sec}:
-                    pd = {pd["id"]: pd for sec in sections.values() for pd in sec}[pid]
-                    if pd.get("char"): mb.update_char(pd["char"], pd["output"])
+                pd_map = {pd["id"]: pd for sec in sections.values() for pd in sec}
+                if pid in pd_map:
+                    pd = pd_map[pid]
+                    # L8: Update memory for ALL characters
+                    for cid in pd.get("all_chars", []):
+                        mb.update_char(cid, pd["output"])
                     if pd.get("env"): mb.update_env(pd["env"], pd["output"])
+                    last_output[get_section(next((p for p in target if p["id"]==pid), target[0]))] = pd["output"]
             elif event == "skip":
                 done += 1; prog(done, total)
             elif event == "fail":
@@ -790,8 +957,11 @@ def run_scenes(key, section_filter):
 
         for sec_name, sec_panels in sections.items():
             if state["stop"]: break
-            log(f"\n--- {sec_name} ({len(sec_panels)} panels) ---", "head")
+            log(f"\n--- {sec_name} ({len(sec_panels)} panels, L1-L12) ---", "head")
             gen_chat_section(client, sec_name, sec_panels, callback=cb)
+            # Layer 10: Save section bridge
+            if sec_name in last_output:
+                mb.update_section(sec_name, last_output[sec_name])
 
         log(f"DONE! OK:{ok_n} Fail:{fail_n}", "ok")
     except Exception as e:

@@ -980,22 +980,34 @@ def count_words(text):
 # ═══════════════════════════════════════════════════════════
 # PROMPT BUILDER
 # ═══════════════════════════════════════════════════════════
-def build_prompt(panel, char_id=None, env_id=None):
-    """Build generation prompt: ANCHOR + CHAR_REF + ENV_REF + STYLE + SCENE."""
+def build_prompt(panel, char_id=None, env_id=None, all_chars=None):
+    """Build generation prompt: ANCHOR + CHAR_REF + ENV_REF + STYLE + SCENE.
+    Layer 8: all_chars = list of ALL character IDs in this panel."""
     scene_prompt = get_image_prompt(panel)
     asset = get_asset_type(panel)
 
     style = get_primary_style() if asset == 'noir' else get_secondary_style()
 
-    # Character ref instruction (1 character only)
+    # Character ref instruction — ALL characters in scene (Layer 8)
     char_str = ""
     chars = get_active_characters()
-    if char_id and char_id in chars:
-        char_str = (
-            f"SUBJECT CONSISTENCY: The character in this scene is {chars[char_id]['name']}. "
-            f"Maintain strict visual consistency with the provided character reference image. "
-            f"Match clothing, build, and appearance exactly. "
-        )
+    char_ids = all_chars or ([char_id] if char_id else [])
+    char_ids = [c for c in char_ids if c and c in chars]
+    if char_ids and asset != 'fern':
+        if len(char_ids) == 1:
+            char_str = (
+                f"SUBJECT CONSISTENCY: The character in this scene is {chars[char_ids[0]]['name']}. "
+                f"You MUST match the provided character reference sheet EXACTLY — same clothing, "
+                f"same build, same proportions, same colors. Do NOT deviate. "
+            )
+        else:
+            names = [chars[c]['name'] for c in char_ids]
+            char_str = (
+                f"SUBJECT CONSISTENCY: This scene contains {len(char_ids)} characters: {', '.join(names)}. "
+                f"Reference sheets are provided for each. Match EVERY character EXACTLY to their "
+                f"reference — same clothing, build, proportions, colors. Each character must be "
+                f"visually distinct and match their own reference sheet. "
+            )
 
     # Environment ref instruction
     env_str = ""
@@ -1297,15 +1309,14 @@ def get_master_shot_prompt(eid):
 class VisualMemoryBank:
     """
     Tracks the latest successful render for each character and environment.
-    When @leo is rendered in S1, that render becomes a ref for @leo in S5.
-    When vault is rendered in S1, that render anchors vault in S7.
-    ABC stays ABC throughout the entire video.
+    Layer 10: Also tracks section bridge frames for cross-section continuity.
     """
     def __init__(self, output_dir):
         self.output_dir = Path(output_dir)
         self.bank_file = self.output_dir / "memory_bank.json"
         self.char_latest = {}   # cid → path to latest successful scene render
         self.env_latest = {}    # eid → path to latest successful scene render
+        self.section_last = {}  # section_name → path to last frame of that section (Layer 10)
         self.load()
 
     def load(self):
@@ -1314,9 +1325,11 @@ class VisualMemoryBank:
                 data = json.loads(self.bank_file.read_text())
                 self.char_latest = data.get("char_latest", {})
                 self.env_latest = data.get("env_latest", {})
+                self.section_last = data.get("section_last", {})
                 # Verify paths still exist
                 self.char_latest = {k: v for k, v in self.char_latest.items() if Path(v).exists()}
                 self.env_latest = {k: v for k, v in self.env_latest.items() if Path(v).exists()}
+                self.section_last = {k: v for k, v in self.section_last.items() if Path(v).exists()}
             except:
                 pass
 
@@ -1324,6 +1337,7 @@ class VisualMemoryBank:
         self.bank_file.write_text(json.dumps({
             "char_latest": self.char_latest,
             "env_latest": self.env_latest,
+            "section_last": self.section_last,
         }, indent=2))
 
     def update_char(self, cid, scene_path):
@@ -1338,27 +1352,35 @@ class VisualMemoryBank:
             self.env_latest[eid] = str(scene_path)
             self.save()
 
+    def update_section(self, section_name, scene_path):
+        """Layer 10: Save last frame of a section for cross-section continuity."""
+        if Path(scene_path).exists():
+            self.section_last[section_name] = str(scene_path)
+            self.save()
+
+    def get_previous_section_bridge(self, current_section, section_order):
+        """Layer 10: Get the last frame from the previous section."""
+        if not section_order:
+            return None
+        try:
+            idx = section_order.index(current_section)
+            if idx > 0:
+                prev = section_order[idx - 1]
+                if prev in self.section_last:
+                    return self.section_last[prev]
+        except (ValueError, IndexError):
+            pass
+        return None
+
     def get_char_refs(self, cid, portrait_refs):
-        """
-        Get best refs for a character:
-        1. Original portraits (front + 3/4) — always included
-        2. Latest successful scene render — if available, adds context
-        Returns list of paths, max 3 images.
-        """
-        refs = list(portrait_refs)  # copy
+        refs = list(portrait_refs)
         if cid in self.char_latest:
             latest = self.char_latest[cid]
             if latest not in refs:
                 refs.append(latest)
-        return refs[:3]  # max 3: front + 3/4 + latest scene
+        return refs[:3]
 
     def get_env_ref(self, eid, master_shot_path, env_ref_path=None):
-        """
-        Get best ref for an environment:
-        1. Master shot (hero render) — primary anchor
-        2. Latest successful scene render in that env — secondary anchor
-        Returns list of paths, max 2 images.
-        """
         refs = []
         if master_shot_path and Path(master_shot_path).exists():
             refs.append(master_shot_path)
@@ -1368,7 +1390,113 @@ class VisualMemoryBank:
             latest = self.env_latest[eid]
             if latest not in refs:
                 refs.append(latest)
-        return refs[:2]  # max 2: master + latest scene
+        return refs[:2]
+
+
+# ═══════════════════════════════════════════════════════════
+# LAYER 9: STYLE ANCHOR
+# ═══════════════════════════════════════════════════════════
+def get_style_anchor_prompt():
+    """Generate a style key image — the single most representative frame.
+    This image gets sent with every panel as a visual style lock."""
+    return (
+        get_world_anchor() +
+        get_primary_style() +
+        "STYLE KEY IMAGE: Generate a single establishing shot that defines the visual "
+        "style of this entire project. A dimly lit underground corridor, cold blue-gray "
+        "tones, dramatic single-source overhead lighting, polished concrete floor reflecting "
+        "light, industrial steel doors at the end, atmospheric dust particles in light beams. "
+        "This image sets the tone for every frame that follows. Cinematic, moody, premium. "
+        "16:9 widescreen. No characters — environment only. "
+    )
+
+
+# ═══════════════════════════════════════════════════════════
+# LAYER 11: CONSISTENCY SCORING
+# ═══════════════════════════════════════════════════════════
+def score_consistency(client, generated_path, ref_paths, panel_desc=""):
+    """Score how well a generated image matches its references.
+    Uses Gemini vision to compare. Returns score 0-100 and feedback."""
+    try:
+        contents = []
+        contents.append("CONSISTENCY EVALUATION: Compare the FIRST image (generated scene) against "
+                       "the REFERENCE images that follow. Score how well the generated scene "
+                       "matches the references on these criteria:\n"
+                       "1. Character appearance (clothing, build, proportions)\n"
+                       "2. Environment consistency (lighting, architecture, mood)\n"
+                       "3. Style consistency (color palette, contrast, atmosphere)\n\n"
+                       "Respond with ONLY a JSON object: {\"score\": <0-100>, \"issues\": \"<brief description>\"}\n"
+                       "Score 80+ = good match, 60-79 = acceptable, below 60 = needs redo.")
+
+        # Generated image first
+        if Path(generated_path).exists():
+            contents.append(Image.open(generated_path))
+        else:
+            return 100, "No image to score"
+
+        # Reference images
+        for rp in ref_paths[:3]:
+            if Path(rp).exists():
+                contents.append(Image.open(rp))
+
+        if len(contents) < 3:  # Need at least prompt + generated + 1 ref
+            return 100, "Not enough refs to score"
+
+        resp = client.models.generate_content(
+            model=get_active_model().replace("-image-preview", ""),  # Use text model
+            contents=contents
+        )
+
+        # Parse response
+        text = ""
+        for part in resp.candidates[0].content.parts:
+            if hasattr(part, 'text') and part.text:
+                text = part.text.strip()
+                break
+
+        # Extract score from JSON
+        import re
+        score_match = re.search(r'"score"\s*:\s*(\d+)', text)
+        issues_match = re.search(r'"issues"\s*:\s*"([^"]*)"', text)
+        score = int(score_match.group(1)) if score_match else 75
+        issues = issues_match.group(1) if issues_match else "Could not parse"
+        return min(100, max(0, score)), issues
+
+    except Exception as e:
+        # If scoring fails, don't block generation
+        return 75, f"Score error: {str(e)[:60]}"
+
+
+# ═══════════════════════════════════════════════════════════
+# LAYER 12: ADAPTIVE PROMPTING
+# ═══════════════════════════════════════════════════════════
+def build_adaptive_prompt(original_prompt, score, issues, attempt=1):
+    """Add correction instructions when consistency score is low."""
+    if score >= 70:
+        return original_prompt  # Good enough
+
+    severity = "CRITICAL" if score < 50 else "IMPORTANT"
+
+    correction = (
+        f"\n\n[{severity} CORRECTION — Attempt {attempt+1}]: "
+        f"The previous generation scored {score}/100 on consistency. "
+        f"Issues: {issues}. "
+    )
+
+    if score < 50:
+        correction += (
+            "You MUST fix this. Match the reference images EXACTLY. "
+            "Same clothing. Same body type. Same proportions. Same colors. "
+            "Same lighting mood. Do NOT improvise or deviate from the references. "
+            "This is a strict visual match requirement. "
+        )
+    else:
+        correction += (
+            "Please improve consistency with the reference images. "
+            "Pay closer attention to character clothing details and environment lighting. "
+        )
+
+    return original_prompt + correction
 
 
 # ═══════════════════════════════════════════════════════════

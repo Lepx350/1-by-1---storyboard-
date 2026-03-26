@@ -215,7 +215,19 @@ body{font-family:'Outfit',system-ui,sans-serif;background:var(--bg);color:var(--
       <button class="batch-btn primary" onclick="run('characters')">Gen Characters</button>
       <button class="batch-btn secondary" onclick="run('environments')">Gen Envs+Masters</button>
     </div>
-    <div class="col-h open" onclick="toggleCol('charBody',this)" style="margin-top:12px">
+    <div class="batch-row">
+      <button class="batch-btn secondary" onclick="genStyleAnchor()">🎨 Gen Style Anchor</button>
+    </div>
+
+    <!-- Style Anchor -->
+    <div class="col-h" onclick="toggleCol('styleBody',this)" style="margin-top:12px">
+      <div class="lbl" style="margin:0;flex:1">Style Anchor (L9) <span id="styleStatus" style="color:var(--t3)"></span></div><span class="ch">▼</span>
+    </div>
+    <div class="col-b" id="styleBody">
+      <div id="styleGal" style="margin-top:6px"></div>
+    </div>
+
+    <div class="col-h open" onclick="toggleCol('charBody',this)" style="margin-top:8px">
       <div class="lbl" style="margin:0;flex:1">Characters <span id="charCount" style="color:var(--m)"></span></div><span class="ch">▼</span>
     </div>
     <div class="col-b open" id="charBody"><div id="charGal" class="gal-env"></div></div>
@@ -355,7 +367,10 @@ async function genOne(pid){
       toast(`${pid}: ${data.error}`,'error');
       btn.className='p-btn gen';btn.textContent='Retry';
     } else {
-      toast(`${pid} done ✓`);
+      const score = data.consistency_score || 0;
+      const scoreColor = score >= 80 ? 'var(--m)' : score >= 60 ? 'var(--a)' : 'var(--r)';
+      const scoreLabel = score >= 80 ? '✓' : score >= 60 ? '~' : '✗';
+      toast(`${pid} done ${scoreLabel} ${score ? `(${score}/100)` : ''}`);
       // Refresh just this panel
       const card=$('panel-'+pid);
       if(card){
@@ -363,6 +378,16 @@ async function genOne(pid){
         imgDiv.innerHTML=`<img src="/api/preview/${pid}?t=${Date.now()}" loading="lazy">`;
         imgDiv.onclick=()=>openPv(`/api/preview/${pid}?t=${Date.now()}`,pid);
         card.classList.add('done');
+        // Show score badge
+        if(score && score < 100){
+          const scoreBadge = card.querySelector('.score-badge');
+          if(scoreBadge) scoreBadge.remove();
+          const badge = document.createElement('span');
+          badge.className='score-badge';
+          badge.style.cssText=`font-family:'Geist Mono',monospace;font-size:9px;padding:2px 6px;border-radius:4px;background:${scoreColor}22;color:${scoreColor};margin-left:auto`;
+          badge.textContent=`${score}/100`;
+          card.querySelector('.panel-top').appendChild(badge);
+        }
       }
       btn.className='p-btn redo';btn.textContent='Redo';
       // Update count
@@ -403,10 +428,39 @@ async function loadRefs(){
     const d=await res.json();
     renderCharGallery(d.chars||[]);
     renderEnvGallery(d.envs||[]);
+    renderStyleAnchor(d.style_anchor||false);
     const charsDone=(d.chars||[]).filter(c=>c.done).length;
     const envsDone=(d.envs||[]).filter(e=>e.env).length;
     $('refsCnt').textContent=`${charsDone+envsDone}`;
   }catch(e){}
+}
+
+// Style anchor
+async function genStyleAnchor(){
+  const key=$('apiKey').value;
+  if(!key){toast('Enter API key','error');return}
+  toast('Generating style anchor...');
+  try{
+    const res=await fetch('/api/gen_style_anchor',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({api_key:key})
+    });
+    const data=await res.json();
+    if(data.error){toast(data.error,'error')}
+    else{toast('Style anchor done ✓');loadRefs()}
+  }catch(e){toast(`Error: ${e.message}`,'error')}
+}
+
+function renderStyleAnchor(exists){
+  const s=$('styleStatus');
+  const g=$('styleGal');
+  if(exists){
+    s.textContent='✓';s.style.color='var(--m)';
+    g.innerHTML=`<div class="gal-item" style="aspect-ratio:16/9;grid-column:span 2" onclick="openPv('/api/ref/style_anchor/style_key','Style Anchor')"><img src="/api/ref/style_anchor/style_key" loading="lazy"><div class="gl">Style Key — L9</div></div>`;
+  } else {
+    s.textContent='—';s.style.color='var(--t3)';
+    g.innerHTML=`<div class="gal-item empty" style="aspect-ratio:16/9">Not generated</div>`;
+  }
 }
 
 function renderCharGallery(chars){

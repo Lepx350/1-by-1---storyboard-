@@ -911,31 +911,13 @@ def _extract_aliases(name, desc):
 
 
 def load_dynamic_characters(storyboard_text):
-    """Extract characters from storyboard and merge with hardcoded defaults.
-    Call this at upload time."""
+    """Extract characters from storyboard. Replaces hardcoded defaults completely.
+    Only falls back to hardcoded if extraction finds nothing."""
     global _dynamic_characters
     extracted = auto_extract_characters(storyboard_text)
     if extracted:
-        # Start with hardcoded, overlay with extracted
-        merged = dict(CHARACTERS)
-        for cid, char in extracted.items():
-            if cid in merged:
-                # Merge aliases: keep hardcoded + add extracted
-                existing_aliases = set(a.lower() for a in merged[cid]["alias"])
-                new_aliases = list(merged[cid]["alias"])
-                for a in char["alias"]:
-                    if a.lower() not in existing_aliases:
-                        new_aliases.append(a)
-                        existing_aliases.add(a.lower())
-                merged[cid]["alias"] = new_aliases
-                # Update desc and views from storyboard (more specific)
-                merged[cid]["desc"] = char["desc"]
-                merged[cid]["views"] = char["views"]
-                merged[cid]["name"] = char["name"]
-            else:
-                # New character not in hardcoded
-                merged[cid] = char
-        _dynamic_characters = merged
+        # Use ONLY extracted characters — no hardcoded bleed
+        _dynamic_characters = extracted
     else:
         _dynamic_characters = dict(CHARACTERS)
     return _dynamic_characters
@@ -1104,13 +1086,42 @@ def gen_single(client, prompt, ref_paths=None, max_retries=3):
             resp = client.models.generate_content(
                 model=get_active_model(), contents=contents, config=get_config()
             )
+            adaptive_delay.success()
             return extract_image(resp)
         except Exception as e:
             if "429" in str(e) and attempt < max_retries - 1:
+                adaptive_delay.rate_limited()
                 wait = 30 * (attempt + 1)  # 30s, 60s, 90s
                 time.sleep(wait)
                 continue
             raise
+
+
+# ═══════════════════════════════════════════════════════════
+# ADAPTIVE DELAY — fast when API allows, slow when it doesn't
+# ═══════════════════════════════════════════════════════════
+class AdaptiveDelay:
+    """Start at 1s. If 429 hit, bump to 4s. Ease back down after consecutive successes."""
+    def __init__(self):
+        self.delay = 1.0
+        self.min_delay = 1.0
+        self.max_delay = 6.0
+        self.successes = 0
+
+    def wait(self):
+        time.sleep(self.delay)
+
+    def success(self):
+        self.successes += 1
+        if self.successes >= 5 and self.delay > self.min_delay:
+            self.delay = max(self.min_delay, self.delay * 0.7)
+            self.successes = 0
+
+    def rate_limited(self):
+        self.delay = min(self.max_delay, self.delay * 2)
+        self.successes = 0
+
+adaptive_delay = AdaptiveDelay()
 
 
 def gen_chat_section(client, section_name, panels_data, callback=None):
@@ -1169,7 +1180,7 @@ def gen_chat_section(client, section_name, panels_data, callback=None):
                             out.write_bytes(img)
                             results[pid] = "ok"
                             if callback: callback("ok", pid)
-                            time.sleep(4)
+                            adaptive_delay.wait()
                             continue
                     except:
                         pass
@@ -1187,7 +1198,7 @@ def gen_chat_section(client, section_name, panels_data, callback=None):
                     results[pid] = "fail"
                     if callback: callback("fail", pid, str(e2)[:80])
 
-            time.sleep(4)
+            adaptive_delay.wait()
 
     except Exception as e:
         # Chat creation failed — fallback all panels to single shot
@@ -1209,7 +1220,7 @@ def gen_chat_section(client, section_name, panels_data, callback=None):
             except Exception as e2:
                 results[pid] = "fail"
                 if callback: callback("fail", pid, str(e2)[:80])
-            time.sleep(4)
+            adaptive_delay.wait()
 
     return results
 

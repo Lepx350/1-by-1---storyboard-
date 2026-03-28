@@ -1017,12 +1017,19 @@ def get_active_model():
     return image_settings.get("model", "gemini-3.1-flash-image-preview")
 
 
+def _resize_for_api(img, max_size=768):
+    """Resize image for API payload. Keeps aspect ratio, caps at max_size px on longest side."""
+    if max(img.size) > max_size:
+        img.thumbnail((max_size, max_size), Image.LANCZOS)
+    return img
+
+
 def gen_single(client, prompt, ref_paths=None, max_retries=3):
     contents = []
     if ref_paths:
         for rp in ref_paths:
             if Path(rp).exists():
-                contents.append(Image.open(rp))
+                contents.append(_resize_for_api(Image.open(rp)))
     contents.append(prompt)
     for attempt in range(max_retries):
         try:
@@ -1102,8 +1109,8 @@ def gen_chat_section(client, section_name, panels_data, callback=None):
                 contents = []
                 for rp in pd.get("refs", []):
                     if Path(rp).exists():
-                        contents.append(Image.open(rp))
-                    if len(contents) >= 5:
+                        contents.append(_resize_for_api(Image.open(rp)))
+                    if len(contents) >= 3:
                         break
                 contents.append(pd["prompt"])
 
@@ -1351,13 +1358,13 @@ def score_consistency(client, generated_path, ref_paths, panel_desc=""):
         )
 
         if Path(generated_path).exists():
-            contents.append(Image.open(generated_path))
+            contents.append(_resize_for_api(Image.open(generated_path)))
         else:
             return 100, "No image to score"
 
         for rp in ref_paths[:3]:
             if Path(rp).exists():
-                contents.append(Image.open(rp))
+                contents.append(_resize_for_api(Image.open(rp)))
 
         if len(contents) < 3:
             return 100, "Not enough refs to score"
